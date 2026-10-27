@@ -45,7 +45,24 @@ int ObIKFTParser::init(const ObFTParserParam &param)
   int ret = OB_SUCCESS;
 
   if (IS_INIT) {
-    ret = OB_INIT_TWICE;
+    // Reuse path: dicts and segmenters are immutable once built, only the
+    // per-document context has to be rebuilt.
+    ObCollationType coll_type = ObCollationType::CS_TYPE_INVALID;
+    if (OB_ISNULL(param.cs_) || OB_ISNULL(param.cs_->name)) {
+      ret = OB_INVALID_ARGUMENT;
+    } else if (CS_TYPE_INVALID == (coll_type = ObCharset::collation_type(param.cs_->name))) {
+      ret = OB_INVALID_ARGUMENT;
+    } else {
+      coll_type_ = coll_type;
+      if (OB_NOT_NULL(ctx_)) {
+        ctx_->~TokenizeContext();
+        allocator_.free(ctx_);
+        ctx_ = nullptr;
+      }
+      if (OB_FAIL(init_ctx(param))) {
+        reset();
+      }
+    }
   } else {
     coll_type_ = ObCollationType::CS_TYPE_INVALID;
     if (OB_ISNULL(param.cs_) || OB_ISNULL(param.cs_->name)) {
@@ -190,22 +207,87 @@ int ObIKFTParser::process_next_batch()
   return ret;
 }
 
+namespace
+{
+// Tokenizing runs once per document on the index-build path and once per
+// tokenize() call, so the parser (dictionaries, segmenters, context buffers)
+// is kept thread-locally and only the per-document context is rebuilt.
+// The wrapper handed to callers lives on the caller's allocator; releasing it
+// marks the thread-local parser as idle again. Nested segment() calls on the
+// same thread fall back to the per-call parser for correctness.
+thread_local ObArenaAllocator *tls_ik_allocator = nullptr;
+thread_local ObIKFTParser *tls_ik_parser = nullptr;
+thread_local bool tls_ik_in_use = false;
+
+class ObIKReuseTokenIter final : public ObITokenIterator
+{
+public:
+  explicit ObIKReuseTokenIter(ObIKFTParser &parser) : parser_(parser) {}
+  virtual ~ObIKReuseTokenIter() override { tls_ik_in_use = false; }
+  virtual int get_next_token(const char *&word,
+                             int64_t &word_len,
+                             int64_t &char_cnt,
+                             int64_t &word_freq) override
+  {
+    return parser_.get_next_token(word, word_len, char_cnt, word_freq);
+  }
+  VIRTUAL_TO_STRING_KV("iter", "ObIKReuseTokenIter");
+
+private:
+  ObIKFTParser &parser_;
+};
+
+} // end anonymous namespace
+
 int ObIKFTParserDesc::segment(ObFTParserParam *param, ObITokenIterator *&iter) const
 {
   int ret = OB_SUCCESS;
   ObIKFTParser *parser = nullptr;
+  ObIKReuseTokenIter *fast_iter = nullptr;
   ObFTDictHub *hub = nullptr;
+  bool input_ok = true;
   if (OB_ISNULL(param) || OB_UNLIKELY(!param->is_valid())) {
     ret = OB_INVALID_ARGUMENT;
+    input_ok = false;
   } else if (OB_FAIL(ObFTParseData::instance().get_dict_hub(hub))) {
-  } else if (OB_ISNULL(parser = OB_NEWx(ObIKFTParser, param->allocator_, *(param->allocator_), hub))) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
-  } else if (OB_FAIL(parser->init(*param))) {
-  } else {
-    iter = parser;
+    input_ok = false;
+  } else if (!tls_ik_in_use) {
+    if (OB_ISNULL(tls_ik_allocator)) {
+      tls_ik_allocator = new (std::nothrow) ObArenaAllocator(ObMemAttr("IKFTParseRuse"));
+    }
+    if (OB_ISNULL(tls_ik_allocator)) {
+      // fall through to the per-call parser
+    } else if (OB_ISNULL(tls_ik_parser)
+               && OB_ISNULL(tls_ik_parser = new (std::nothrow) ObIKFTParser(*tls_ik_allocator, hub))) {
+      // fall through to the per-call parser
+    } else if (OB_FAIL(tls_ik_parser->init(*param))) {
+      // broken parser: drop it and fall through to the per-call parser
+      tls_ik_parser->~ObIKFTParser();
+      delete tls_ik_parser;
+      tls_ik_parser = nullptr;
+      tls_ik_allocator->reset();
+    } else if (OB_ISNULL(fast_iter = OB_NEWx(ObIKReuseTokenIter, param->allocator_, *tls_ik_parser))) {
+      tls_ik_parser->~ObIKFTParser();
+      delete tls_ik_parser;
+      tls_ik_parser = nullptr;
+    } else {
+      tls_ik_in_use = true;
+      iter = fast_iter;
+      return ret;
+    }
+    // fast path unavailable this call: retry through the per-call parser
+    ret = OB_SUCCESS;
   }
 
-  if (OB_FAIL(ret)) {
+  if (input_ok) {
+    parser = nullptr;
+    if (OB_ISNULL(parser = OB_NEWx(ObIKFTParser, param->allocator_, *(param->allocator_), hub))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else if (OB_FAIL(parser->init(*param))) {
+    } else {
+      iter = parser;
+      return ret;
+    }
     OB_DELETEx(ObIKFTParser, param->allocator_, parser);
   }
 

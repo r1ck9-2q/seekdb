@@ -76,7 +76,10 @@ int ObBEngFTParser::init(ObFTParserParam *param)
     analysis_ctx_.cs_ = param->cs_;
     analysis_ctx_.filter_stopword_ = false;
     analysis_ctx_.need_grouping_ = false;
-    if (OB_FAIL(english_analyzer_.init(analysis_ctx_, *param->allocator_))) {
+    // Allocate analyzer resources from the parser's own allocator: for the
+    // thread-local reused parser it outlives this call, for the per-call
+    // parser it is param->allocator_ anyway.
+    if (OB_FAIL(english_analyzer_.init(analysis_ctx_, allocator_))) {
     } else if (OB_FAIL(segment(doc_, token_stream_))) {
     } else if (OB_ISNULL(token_stream_)) {
       ret = OB_ERR_UNEXPECTED;
@@ -113,6 +116,37 @@ void ObBEngFTParser::reset()
   is_inited_ = false;
 }
 
+namespace
+{
+// The BENG parser and its analyzer pipeline are rebuilt per document today;
+// keep one thread-local instance and only reset/re-init its per-document
+// state. Nested segment() calls on the same thread fall back to the per-call
+// parser for correctness.
+thread_local ObArenaAllocator *tls_beng_allocator = nullptr;
+thread_local ObBEngFTParser *tls_beng_parser = nullptr;
+thread_local bool tls_beng_in_use = false;
+
+class ObBEngReuseTokenIter final : public ObITokenIterator
+{
+public:
+  explicit ObBEngReuseTokenIter(ObBEngFTParser &parser) : parser_(parser) {}
+  virtual ~ObBEngReuseTokenIter() override { tls_beng_in_use = false; }
+  virtual int get_next_token(
+      const char *&word,
+      int64_t &word_len,
+      int64_t &char_len,
+      int64_t &word_freq) override
+  {
+    return parser_.get_next_token(word, word_len, char_len, word_freq);
+  }
+  VIRTUAL_TO_STRING_KV("iter", "ObBEngReuseTokenIter");
+
+private:
+  ObBEngFTParser &parser_;
+};
+
+} // end anonymous namespace
+
 ObBasicEnglishFTParserDesc::ObBasicEnglishFTParserDesc() {}
 
 int ObBasicEnglishFTParserDesc::segment(
@@ -121,16 +155,50 @@ int ObBasicEnglishFTParserDesc::segment(
 {
   int ret = OB_SUCCESS;
   ObBEngFTParser *parser = nullptr;
+  ObBEngReuseTokenIter *fast_iter = nullptr;
+  bool input_ok = true;
   if (OB_ISNULL(param) || OB_ISNULL(param->fulltext_) || OB_UNLIKELY(!param->is_valid())) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (OB_ISNULL(parser = OB_NEWx(ObBEngFTParser, param->allocator_, *(param->allocator_)))) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
-  } else if (OB_FAIL(parser->init(param))) {
-  } else {
-    iter = parser;
+    input_ok = false;
+  } else if (!tls_beng_in_use) {
+    if (OB_ISNULL(tls_beng_allocator)) {
+      tls_beng_allocator = new (std::nothrow) ObArenaAllocator(ObMemAttr("BEngParseRuse"));
+    }
+    if (OB_ISNULL(tls_beng_allocator)) {
+      // fall through to the per-call parser
+    } else if (OB_ISNULL(tls_beng_parser)
+               && OB_ISNULL(tls_beng_parser = new (std::nothrow) ObBEngFTParser(*tls_beng_allocator))) {
+      // fall through to the per-call parser
+    } else {
+      tls_beng_parser->reset();
+      if (OB_FAIL(tls_beng_parser->init(param))) {
+        // broken parser: drop it and fall through to the per-call parser
+        tls_beng_parser->~ObBEngFTParser();
+        delete tls_beng_parser;
+        tls_beng_parser = nullptr;
+        tls_beng_allocator->reset();
+      } else if (OB_ISNULL(fast_iter = OB_NEWx(ObBEngReuseTokenIter, param->allocator_, *tls_beng_parser))) {
+        tls_beng_parser->~ObBEngFTParser();
+        delete tls_beng_parser;
+        tls_beng_parser = nullptr;
+      } else {
+        tls_beng_in_use = true;
+        iter = fast_iter;
+        return ret;
+      }
+    }
+    ret = OB_SUCCESS;
   }
 
-  if (OB_FAIL(ret)) {
+  if (input_ok) {
+    parser = nullptr;
+    if (OB_ISNULL(parser = OB_NEWx(ObBEngFTParser, param->allocator_, *(param->allocator_)))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else if (OB_FAIL(parser->init(param))) {
+    } else {
+      iter = parser;
+      return ret;
+    }
     OB_DELETEx(ObBEngFTParser, param->allocator_, parser);
   }
 
